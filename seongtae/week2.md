@@ -199,3 +199,124 @@ updateInventory()
 
 - 엔티티를 병합하고 수정 사항을 데이터베이스에 전파
 - 그러는 사이 다른 수정 사항이 발생하면 낙관적 잠금 예외가 발생
+
+# 엔티티가 수정되지 않은 경우에도 잠긴 엔티티 버전을 증가시키는 방법
+
+- 다른 사람이 수정한 사항을 저장하지 않은 경우에만 변경 사항을 저장하고자 한다면? (= 순차적으로 수정 사항을 적용하고자 한다면?)
+- Chapter와 Modification 엔티티가 서로 1:N 관계임을 가정
+
+## OPTIMISTIC_FORCE_INCREMENT
+
+- @Version과 OPTIMISTIC_FORCE_INCREMENT 잠금 전략 사용
+- 이 두 가지 설정을 함께 사용하면 엔티티가 수정되지 않은 경우에도 잠긴 엔티티의 버전을 증가시킬 수 있다.
+- 각각의 수정은 부모 엔티티의 낙관적 잠금 버전으로 강제 반영된다. (Chapter : Modification 관계에서 Modification 엔티티는 Chapter 엔티티의 버전을 따름)
+
+```java
+// Chapter.java
+@Entity
+public class Chapter implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String title;
+    private String content;
+
+    @Version
+    private short version;
+
+    // ...
+}
+```
+
+```java
+// Modification.java
+@Entity
+public class Modification implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String description;
+    private String modification;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    private Chapter chapter;
+
+    // ...
+}
+```
+
+`LockModeType.OPTIMISTIC_FORCE_INCREMENT` 잠금 전략을 사용해 ID로 챕터를 로드한다.
+
+```java
+@Repository
+public interface ChapterRepository extends JpaRepository<Chapter, Long> {
+    @Override
+    @Lock(LockModeType.OPTIMISTIC_FORCE_INCREMENT)
+    Optional<Chapter> findById(Long id);
+}
+```
+
+이제 다음과 같은 시나리오를 가정한다.
+
+1. 편집자 1이 챕터 1을 로드한다.
+2. 편집자 2도 챕터 1을 로드한다.
+3. 편집자 2는 수정을 반영하고 저장한다.
+4. 편집자 2는 이 수정 사항을 챕터 1 낙관적 잠금 버전에 강제로 전파한다. 편집자 2의 트랜잭션이 커밋된다.
+5. 편집자 1이 수정을 반영하고 저장하려고 시도한다.
+6. 편집자 1은 그 사이에 편집자 2가 수정을 추가했기 때문에 낙관적 잠금 예외가 발생한다.
+
+👍 => 자식 엔티티들이 부모 엔티티의 버전을 통해 낙관적 잠금 예외를 발생시킬 수 있다.
+
+```
+내부적으로 자식 엔티티가 수정됐을 때, 부모 엔티티의 낙관적 잠금 버전에 강제적으로 전파하기 때문!
+```
+
+## PESSIMISTIC_FORCE_INCREMENT
+
+- OPTIMISTIC_FORCE_INCREMENT는 현재 트랝잭션이 끝날 때 버전 증가
+- ↔️ PESSIMISTIC_FORCE_INCREMENT는 즉시 버전을 증가.
+- 엔티티 버전은 행 수준 잠금(Write Lock)을 획득하기에 성공됨을 보장
+- 증가는 엔티티가 데이터 액세스 계층으로 반환되기 전에 발생
+- `@Lock(LockModeType.PESSIMISTIC_FORCE_INCREMENT)`를 사용
+
+```java
+@Repository
+public interface ChapterRepository extends JpaRepository<Chapter, Long> {
+    @Override
+    @Lock(LockModeType.PESSIMISTIC_FORCE_INCREMENT)
+    Optional<Chapter> findById(Long id);
+
+    Chapter findByTitle(String title);
+}
+```
+
+이제 다음과 같은 시나리오를 가정한다.
+
+1. 편집자 1은 락을 획득하지 않고 챕터 1을 로드
+2. 편집자 2도 챕터 1을 PESSIMISTIC_FORCE_INCREMENT로 로드
+3. 편집자 2는 행 잠금을 얻고 버전을 즉시 증가
+4. 편집자 2가 수정 사항을 저장
+5. 편집자 1은 1. 에서 로드한 챕터 1 엔티티에 대해 PESSIMISTIC_FORCE_INCREMENT를 획득하려고 시도
+6. 편집자 1은 낙관적 잠금 예외가 발생(편집자 2가 버전을 업데이트한 수정 사항을 추가했기 떄문).
+
+```
+배타적 락을 획득하고자 하이버네이트는 기본 Dialect 잠금 절을 사용
+MySQL의 MySQL5Dialect(MyISAM)는 행 수준 잠금을 지원하지 않으며, MySQL5InnoDBDialect는 FOR UPDATE를 통해 행 수준 잠금을 획득.
+MySQL8Dialect(InnoDB)는 FOR UPDATE NOWAIT를 통해 행 수준 잠금을 획득한다.
+
+PostgreSQL에서 PostgreSQL95Dialect는 FOR UPDATE NOWAIT를 통해 행 수준 잠금을 획득
+
+엔티티 버전을 증가시키는 트랜잭션은 행 수준 락은 해제할 때까지 PESSIMISTIC_FORCE_INCREMENT 락을 획득하려는 다른 트랜잭션을 차단.
+-> 데드락을 피하고자 NOWAIT 또는 명시적인 짧은 타임아웃을 활용해야 한다.
+```
+
+```
+MySQL은 REPEATABLE_READ를 기본 트랜잭션 격리 수준으로 사용하며, 획득한 락을 트랜잭션 기간 동안 유지함
+READ_COMMITTED 격리 수준에서는 STATEMENT가 완료된 후 불필요한 잠금이 해제된다.
+```
